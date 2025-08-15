@@ -7,6 +7,8 @@ werden automatisch die echten Klassen verwendet, falls verfügbar.
 
 import os
 from typing import Any, Dict
+import logging
+log_dbus = logging.getLogger("DBUS")
 
 REAL_DBUS = False
 try:
@@ -22,6 +24,15 @@ try:
     import dbus  # type: ignore
 except Exception:
     dbus = None
+
+
+def _get_system_bus():
+    if dbus is None:
+        return None
+    try:
+        return dbus.SystemBus()
+    except Exception:
+        return None
 
 
 def is_real_dbus() -> bool:
@@ -40,10 +51,14 @@ class _StubVeDbusService:
     def __init__(self, name: str):
         self.name = name
         self.paths: Dict[str, Any] = {}
+        self._registered = False
 
     def add_path(self, path: str, value=None, writeable=True, onchangecallback=None, gettextcallback=None):
         self.paths[path] = value
         return True
+
+    def register(self):
+        self._registered = True
 
     def __setitem__(self, path: str, value: Any):
         self.paths[path] = value
@@ -55,14 +70,43 @@ class _StubVeDbusService:
 class VeDbusServiceWrapper:
     """
     Vereinheitlicht Zugriff auf echten VeDbusService und Stub.
+    - Auf Venus OS: nutzt **SystemBus** explizit.
+    - `register()` steht zur Verfügung (bei echtem Service wird wirklich registriert).
     """
-    def __init__(self, name: str, dry: bool = False):
+    def __init__(self, name: str, dry: bool = False, register: bool = True):
         self.name = name
         self.dry = dry or not REAL_DBUS
-        self._svc = _StubVeDbusService(name) if self.dry else VeDbusService(name)
+        self._bus = _get_system_bus()
+        if self.dry or self._bus is None or VeDbusService is None:
+            self._svc = _StubVeDbusService(name)
+        else:
+            # Erst ohne auto-Register anlegen, damit wir zunächst Management-Pfade setzen können
+            self._svc = VeDbusService(name, bus=self._bus, register=False)
+        # Standard-Mgmt-Pfade hinzufügen; /Connected dann vom Aufrufer gesetzt
+        try:
+            self.add("/Mgmt/ProcessName", os.path.basename(__file__))
+            self.add("/Mgmt/ProcessVersion", "python")
+        except Exception:
+            pass
+        # Optional sofort registrieren
+        if register:
+            self.register()
+
+    def register(self):
+        try:
+            self._svc.register()
+            log_dbus.debug("registered service on system bus: %s", self.name)
+        except Exception:
+            # Stub oder bereits registriert
+            pass
 
     def add(self, path: str, value=None):
-        self._svc.add_path(path, value=value, writeable=True)
+        try:
+            self._svc.add_path(path, value=value, writeable=True)
+        except Exception:
+            # Stub
+            if isinstance(self._svc, _StubVeDbusService):
+                self._svc.add_path(path, value=value, writeable=True)
 
     def set(self, path: str, value):
         try:
@@ -78,6 +122,11 @@ class VeDbusServiceWrapper:
             return self._svc[path]
         except Exception:
             return default
+
+    @property
+    def raw(self):
+        """Zugriff auf das native Service-Objekt (VeDbusService oder Stub)."""
+        return self._svc
 
 
 class SettingsStore:
@@ -138,3 +187,14 @@ class BatteryDbusReader:
             return {"V": v, "I": i, "P": p, "SOC": soc}
         except Exception:
             return None
+
+
+def list_system_services_prefix(prefix: str = "com.victronenergy.") -> list:
+    if not REAL_DBUS or dbus is None:
+        return []
+    try:
+        bus = _get_system_bus()
+        names = bus.list_names()
+        return [n for n in names if str(n).startswith(prefix)]
+    except Exception:
+        return []
