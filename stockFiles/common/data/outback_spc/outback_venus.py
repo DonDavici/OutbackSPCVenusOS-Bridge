@@ -15,6 +15,9 @@ import sys
 import time
 from datetime import date
 from typing import Dict, Any
+import subprocess
+import shlex
+import re
 
 # Lokale Module
 from modules.loggerx import make_logger, Summary
@@ -88,6 +91,8 @@ def setup_argparser() -> argparse.ArgumentParser:
 
     # Quellen
     p.add_argument("--ble-mac", default="", help="Outback BLE MAC (optional)")
+    p.add_argument("--ble-addrtype", choices=["public", "random"], default=None,
+                   help="BLE Address Type (überschreibt ENV/Settings, Standard: public)")
     p.add_argument("--tuya-id", default="", help="Tuya Device ID (optional)")
     p.add_argument("--tuya-key", default="", help="Tuya LocalKey (optional)")
     p.add_argument("--et112-l2", default="", help="ET112 L2 Quelle (optional Hinweis)")
@@ -154,9 +159,94 @@ def midnight_changed(last_ymd: str) -> (bool, str):
     return (last_ymd != now_ymd), now_ymd
 
 
+
 def graceful_exit(signum, frame):
     global RUN
     RUN = False
+
+# ──────────────────────────────────────────────────────────────
+# Autodetect-Helfer: bluetoothctl Wrapper + Parser
+# ──────────────────────────────────────────────────────────────
+
+def _btctl(cmd: str, timeout: int = 8) -> str:
+    """bluetoothctl-Einzelbefehl ausführen und stdout liefern (robust, mit Timeout)."""
+    try:
+        out = subprocess.check_output(
+            ["bash", "-lc", f"bluetoothctl --timeout {int(timeout)} {shlex.quote(cmd)}"],
+            stderr=subprocess.STDOUT,
+            timeout=timeout + 2,
+        )
+        return out.decode("utf-8", errors="ignore")
+    except subprocess.CalledProcessError as e:
+        return e.output.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _bt_list_devices() -> Dict[str, str]:
+    """Parst `bluetoothctl devices` → {MAC: NAME}."""
+    out = _btctl("devices", timeout=5)
+    res: Dict[str, str] = {}
+    for line in out.splitlines():
+        m = re.match(r"^Device\s+([0-9A-F:]{17})\s+(.+)$", line.strip())
+        if m:
+            res[m.group(1)] = m.group(2).strip()
+    return res
+
+
+def _bt_info(mac: str) -> Dict[str, str]:
+    """Parst `bluetoothctl info <MAC>` in ein Dict."""
+    out = _btctl(f"info {mac}", timeout=5)
+    info: Dict[str, str] = {}
+    for line in out.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            info[k.strip()] = v.strip()
+    return info
+
+
+def autodetect_outback_mac(log, target_name: str = "ID55355535553555") -> Dict[str, str]:
+    """Sucht Outback anhand des Anzeigenamens, führt trust/pair aus (idempotent),
+    und liefert {mac, addrtype, paired, trusted, source}."""
+    log.info(f"autodetect: suche Gerät mit Name '{target_name}' …")
+
+    devs = _bt_list_devices()
+    mac = next((m for m, n in devs.items() if n.strip() == target_name), None)
+
+    if not mac:
+        log.debug("autodetect: kein Treffer in 'devices' – starte Scan (8s)")
+        _btctl("scan on", timeout=8)
+        _btctl("scan off", timeout=3)
+        devs = _bt_list_devices()
+        mac = next((m for m, n in devs.items() if n.strip() == target_name), None)
+
+    if not mac:
+        log.warning("autodetect: kein passendes Gerät gefunden")
+        return {"mac": "", "addrtype": "public", "paired": False, "trusted": False, "source": "none"}
+
+    log.info(f"autodetect: gefunden mac={mac}")
+    info = _bt_info(mac)
+    paired = info.get("Paired", "no").lower() == "yes"
+    trusted = info.get("Trusted", "no").lower() == "yes"
+    addr_raw = info.get("Address Type", "public")
+    addrtype = "random" if addr_raw.lower().startswith("random") else "public"
+
+    if not trusted:
+        log.info(f"autodetect: setze trust für {mac}")
+        _btctl(f"trust {mac}", timeout=5)
+        info = _bt_info(mac)
+        trusted = info.get("Trusted", "no").lower() == "yes"
+
+    if not paired:
+        log.info(f"autodetect: versuche pair mit {mac}")
+        _btctl(f"pair {mac}", timeout=12)
+        info = _bt_info(mac)
+        paired = info.get("Paired", "no").lower() == "yes"
+        if not paired:
+            log.warning("autodetect: Pairing evtl. unvollständig (ggf. Bestätigung am Gerät nötig)")
+
+    log.info(f"autodetect: status paired={paired} trusted={trusted} addrType={addrtype}")
+    return {"mac": mac, "addrtype": addrtype, "paired": paired, "trusted": trusted, "source": "scan"}
 
 
 def main():
@@ -194,6 +284,8 @@ def main():
         "/Settings/Log/TestMode": "INFO",
         "/Settings/Log/RateLimitMs": 500,
         "/Settings/Log/SummaryPeriodSec": args.summary_period,
+        "/Settings/Devices/OutbackSPC/BLE/Mac": "",
+        "/Settings/Devices/OutbackSPC/BLE/AddrType": "public",
     })
 
     # Logger
@@ -212,18 +304,61 @@ def main():
 
     # Quellen
     testmode = TestMode(settings=settings, seed=args.seed, scenario=args.testmode)
-    ble = BleOutbackClient(mac=args.ble_mac, hci=args.hci,
+    # BLE-MAC & AddrType resolvieren (Priorität: CLI > Settings > ENV)
+    mac_cli = (args.ble_mac or "").strip()
+    mac_cfg = (settings.get("/Settings/Devices/OutbackSPC/BLE/Mac", "") or "").strip()
+    mac_env = (os.getenv("OUTBACK_BLE_MAC", "") or "").strip()
+    mac_resolved = mac_cli or mac_cfg or mac_env  # leer → Client versucht Legacy utils
+
+    addr_cli = (args.ble_addrtype or None)
+    addr_cfg = (settings.get("/Settings/Devices/OutbackSPC/BLE/AddrType", "public") or "public").strip().lower()
+    addr_env = (os.getenv("OUTBACK_BLE_ADDRTYPE", "") or "").strip().lower()
+    addr_resolved = (addr_cli or addr_env or addr_cfg)
+    if addr_resolved not in ("public", "random"):
+        addr_resolved = "public"
+
+    # Falls CLI-MAC gesetzt wurde und sich von Settings unterscheidet → in Settings spiegeln
+    if mac_cli and mac_cli != mac_cfg:
+        settings.set("/Settings/Devices/OutbackSPC/BLE/Mac", mac_cli)
+    if addr_cli and addr_cli != addr_cfg:
+        settings.set("/Settings/Devices/OutbackSPC/BLE/AddrType", addr_cli)
+
+    # Wenn keine MAC vorhanden → Autodetect versuchen
+    autodetect_used = False
+    if not mac_resolved:
+        log_core.info("startup: keine BLE-MAC in CLI/Settings/ENV → Autodetect wird versucht …")
+        ad = autodetect_outback_mac(log_core)
+        if ad.get("mac"):
+            mac_resolved = ad["mac"]
+            autodetect_used = True
+            # AddrType ggf. aus Info übernehmen, wenn nicht explizit gesetzt
+            if not args.ble_addrtype and not addr_env:
+                addr_resolved = ad.get("addrtype", addr_resolved)
+            # Persistieren in Settings
+            settings.set("/Settings/Devices/OutbackSPC/BLE/Mac", mac_resolved)
+            settings.set("/Settings/Devices/OutbackSPC/BLE/AddrType", addr_resolved)
+            log_core.info(f"autodetect: MAC in Settings gespeichert ({mac_resolved}, addrType={addr_resolved})")
+        else:
+            log_core.warning("autodetect: kein Gerät gefunden – weiter ohne BLE (L1 bleibt 0)")
+
+    # BLE-Client anlegen (mac darf leer sein → Client versucht ENV/utils)
+    os.environ.setdefault("OUTBACK_BLE_ADDRTYPE", addr_resolved)
+    if mac_resolved:
+        os.environ.setdefault("OUTBACK_BLE_MAC", mac_resolved)
+
+    ble = BleOutbackClient(mac=mac_resolved, hci=args.hci,
                            min_interval_s=args.bt_interval,
                            backoff_max_s=args.bt_backoff_max,
                            debug=args.debug)
+    src = ("CLI" if mac_cli else ("SETTINGS" if mac_cfg else ("ENV" if mac_env else ("SCAN" if 'autodetect_used' in locals() and autodetect_used and mac_resolved else "AUTO"))))
     try:
         s0 = ble.get_status() if hasattr(ble, "get_status") else {}
     except Exception:
         s0 = {}
     log_core.info(
-        f"startup: BLE mac={s0.get('mac', args.ble_mac or '?')} "
+        f"startup: BLE mac={s0.get('mac', mac_resolved or '?')} (src={src}) "
         f"(hci={s0.get('hci', args.hci)}) "
-        f"backend={s0.get('backend','?')}/{s0.get('addr_type','?')} "
+        f"backend={s0.get('backend','?')}/{s0.get('addr_type', addr_resolved)} "
         f"debug={str(bool(args.debug)).lower()}"
     )
     batt_reader = BatteryDbusReader()
