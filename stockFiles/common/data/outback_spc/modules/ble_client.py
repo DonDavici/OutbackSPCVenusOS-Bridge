@@ -61,6 +61,18 @@ def _resolve_mac(provided: str) -> Tuple[str, str]:
         pass
     return "B0:7E:11:F9:BC:F2", "default"
 
+def _resolve_backend() -> str:
+    be = os.getenv("OUTBACK_BLE_BACKEND", "").lower()
+    if be in ("bleak", "bluepy"):
+        return be
+    return ""
+
+def _resolve_addrtype() -> str:
+    at = os.getenv("OUTBACK_BLE_ADDRTYPE", "").lower()
+    if at in ("public", "random"):
+        return at
+    return "public"
+
 def _swap_decode(buf: bytes) -> tuple:
     shorts = struct.unpack('>' + 'h' * (len(buf)//2), buf)
     return tuple(((v >> 8) & 255) | ((v & 255) << 8) for v in shorts)
@@ -116,15 +128,23 @@ class BleOutbackClient:
         self._consec_fails = 0
 
         # Backend-spezifisch
-        self._backend = "bleak" if _HAVE_BLEAK else ("bluepy" if _HAVE_BLUEPY else "none")
+        wanted = _resolve_backend()
+        if wanted == "bleak":
+            self._backend = "bleak" if _HAVE_BLEAK else ("bluepy" if _HAVE_BLUEPY else "none")
+        elif wanted == "bluepy":
+            self._backend = "bluepy" if _HAVE_BLUEPY else ("bleak" if _HAVE_BLEAK else "none")
+        else:
+            self._backend = "bleak" if _HAVE_BLEAK else ("bluepy" if _HAVE_BLUEPY else "none")
+        self.addr_type = _resolve_addrtype()
+
         self._client = None      # BleakClient oder bluepy.Peripheral
         self._c03 = None; self._c11 = None
 
         # Status
         self.last_status = "init"
         self.last_error = ""
-        self._d("init: backend=%s mac=%s (source=%s) hci=%s min=%.1fs backoff<=%.1fs",
-                self._backend, self.mac, self._mac_source, self.hci, self.min_interval_s, self.backoff_max_s)
+        self._d("init: backend=%s addr_type=%s mac=%s (source=%s) hci=%s min=%.1fs backoff<=%.1fs",
+                self._backend, self.addr_type, self.mac, self._mac_source, self.hci, self.min_interval_s, self.backoff_max_s)
 
     # ── Gemeinsame Planung/Stats ───────────────────────────────
     def _schedule_next(self, success: bool):
@@ -183,7 +203,7 @@ class BleOutbackClient:
         self._d("bluepy connect: trying %s on %s", self.mac, self.hci)
         def _do_connect():
             iface = int(self.hci[3:]) if self.hci.startswith("hci") else 0
-            p = Peripheral(self.mac, iface=iface)
+            p = Peripheral(self.mac, iface=iface, addrType=self.addr_type)
             s10 = p.getServiceByUUID(_SRV_1810)
             s11 = p.getServiceByUUID(_SRV_1811)
             c03 = s10.getCharacteristics(_A03)[0]
@@ -319,5 +339,5 @@ class BleOutbackClient:
             "mac": self.mac,
             "hci": self.hci,
             "backend": self._backend,
+            "addr_type": getattr(self, "addr_type", "?"),
         }
-    

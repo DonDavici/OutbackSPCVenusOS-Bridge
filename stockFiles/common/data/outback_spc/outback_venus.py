@@ -220,7 +220,12 @@ def main():
         s0 = ble.get_status() if hasattr(ble, "get_status") else {}
     except Exception:
         s0 = {}
-    log_core.info(f"startup: BLE mac={s0.get('mac', args.ble_mac or '?')} "f"(hci={s0.get('hci', args.hci)}) "f"debug={str(bool(args.debug)).lower()}")
+    log_core.info(
+        f"startup: BLE mac={s0.get('mac', args.ble_mac or '?')} "
+        f"(hci={s0.get('hci', args.hci)}) "
+        f"backend={s0.get('backend','?')}/{s0.get('addr_type','?')} "
+        f"debug={str(bool(args.debug)).lower()}"
+    )
     batt_reader = BatteryDbusReader()
     tuya = TuyaClient(dev_id=args.tuya_id, local_key=args.tuya_key)
     et_l2 = Et112Reader(source_hint=args.et112_l2)
@@ -333,7 +338,12 @@ def main():
             cfc = s.get("consec_fails", 0)
             mac = s.get("mac", "?")
             hci = s.get("hci", "?")
-            log_core.debug(f"BLE[{stat}] mac={mac} hci={hci} next={nxt:.1f}s ok={okc} fail={flc} consec={cfc} rssi={rssi}")
+            backend = s.get("backend", "?")
+            addr_t  = s.get("addr_type", "?")
+            log_core.debug(
+                f"BLE[{stat}] mac={mac} hci={hci} backend={backend}/{addr_t} "
+                f"next={nxt:.1f}s ok={okc} fail={flc} consec={cfc} rssi={rssi}"
+            )
             ble_dbg_last = now_mono
 
         # === EMA-Glättung ===
