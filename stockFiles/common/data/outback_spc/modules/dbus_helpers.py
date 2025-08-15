@@ -11,10 +11,17 @@ from typing import Any, Dict
 REAL_DBUS = False
 try:
     # Auf Venus OS vorhanden
-    from vedbus import VeDbusService  # type: ignore
+    from vedbus import VeDbusService, VeDbusItemImport  # type: ignore
     REAL_DBUS = True
 except Exception:
     VeDbusService = None  # Stub folgt
+    VeDbusItemImport = None
+    REAL_DBUS = False
+
+try:
+    import dbus  # type: ignore
+except Exception:
+    dbus = None
 
 
 def is_real_dbus() -> bool:
@@ -92,3 +99,42 @@ class SettingsStore:
 
     def set(self, key: str, value: Any):
         self.state_ref["settings"][key] = value
+
+# Am Dateiende (oder nach SettingsStore) hinzufügen:
+class BatteryDbusReader:
+    """
+    Liest – falls verfügbar – den ersten com.victronenergy.battery.* Service:
+    /Dc/0/Voltage, /Dc/0/Current, /Dc/0/Power, /Soc
+    Rückgabe: {"V":float,"I":float,"P":float,"SOC":float} oder None.
+    """
+    def __init__(self):
+        self._bus = None
+        self._paths = None
+        if REAL_DBUS and dbus is not None and VeDbusItemImport is not None:
+            try:
+                # System-Bus
+                self._bus = dbus.SystemBus()
+                names = self._bus.list_names()
+                target = next((n for n in names if str(n).startswith("com.victronenergy.battery.")), None)
+                if target:
+                    self._paths = {
+                        "V": VeDbusItemImport(self._bus, target, "/Dc/0/Voltage"),
+                        "I": VeDbusItemImport(self._bus, target, "/Dc/0/Current"),
+                        "P": VeDbusItemImport(self._bus, target, "/Dc/0/Power"),
+                        "SOC": VeDbusItemImport(self._bus, target, "/Soc"),
+                    }
+            except Exception:
+                self._bus = None
+                self._paths = None
+
+    def read(self):
+        if not self._paths:
+            return None
+        try:
+            v = float(self._paths["V"].get_value())
+            i = float(self._paths["I"].get_value())
+            p = float(self._paths["P"].get_value())
+            soc = float(self._paths["SOC"].get_value())
+            return {"V": v, "I": i, "P": p, "SOC": soc}
+        except Exception:
+            return None

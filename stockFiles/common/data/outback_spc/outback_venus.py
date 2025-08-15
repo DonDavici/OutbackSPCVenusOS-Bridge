@@ -24,7 +24,7 @@ from modules.state_machine import (
     clamp, EMA
 )
 from modules.dbus_helpers import (
-    is_real_dbus, VeDbusServiceWrapper, SettingsStore, ensure_data_dir
+    is_real_dbus, VeDbusServiceWrapper, SettingsStore, ensure_data_dir, BatteryDbusReader
 )
 from modules.services import (
     InverterOutbackService, PVInverterService, GridGeneratorService, AcMeterService
@@ -92,6 +92,9 @@ def setup_argparser() -> argparse.ArgumentParser:
     p.add_argument("--tuya-key", default="", help="Tuya LocalKey (optional)")
     p.add_argument("--et112-l2", default="", help="ET112 L2 Quelle (optional Hinweis)")
     p.add_argument("--et112-l3", default="", help="ET112 L3 Quelle (optional Hinweis)")
+    p.add_argument("--hci", default="hci0", help="BLE-Adapter (z. B. hci0)")
+    p.add_argument("--bt-interval", type=float, default=1.8, help="Mindest-Rundenintervall s")
+    p.add_argument("--bt-backoff-max", type=float, default=15.0, help="Max. Backoff s bei Fehlern")
 
     # Testmodus
     p.add_argument("--testmode", choices=[
@@ -209,7 +212,11 @@ def main():
 
     # Quellen
     testmode = TestMode(settings=settings, seed=args.seed, scenario=args.testmode)
-    ble = BleOutbackClient(mac=args.ble_mac)  # Stub liefert None außerhalb Test
+    ble = BleOutbackClient(mac=args.ble_mac, hci=args.hci,
+                           min_interval_s=args.bt_interval,
+                           backoff_max_s=args.bt_backoff_max,
+                           debug=args.debug)
+    batt_reader = BatteryDbusReader()
     tuya = TuyaClient(dev_id=args.tuya_id, local_key=args.tuya_key)
     et_l2 = Et112Reader(source_hint=args.et112_l2)
     et_l3 = Et112Reader(source_hint=args.et112_l3)
@@ -287,9 +294,13 @@ def main():
                 rssi = -99
                 last_ble_update = 0
 
-            # Batterie von BMV-712 (falls über D‑Bus verfügbar). Stub gibt 0.
-            b = testmode.read_battery_live_fallback()
-            batt_v, batt_i, batt_p, batt_soc = b["V"], b["I"], b["P"], b["SOC"]
+            # Batterie vom BMV-712 (DC-Wahrheit) via D-Bus bevorzugen; Fallback lokal
+            b_live = batt_reader.read()
+            if b_live is not None:
+                batt_v, batt_i, batt_p, batt_soc = b_live["V"], b_live["I"], b_live["P"], b_live["SOC"]
+            else:
+                b = testmode.read_battery_live_fallback()
+                batt_v, batt_i, batt_p, batt_soc = b["V"], b["I"], b["P"], b["SOC"]
 
             # L2/L3 von ET112 (optional). Stub = 0.
             l2_power = et_l2.read_power()
