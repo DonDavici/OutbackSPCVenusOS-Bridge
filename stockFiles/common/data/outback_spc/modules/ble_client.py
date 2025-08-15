@@ -52,6 +52,7 @@ def _resolve_mac(cli: Optional[str]) -> Tuple[str, str]:
         if legacy: return legacy, "utils"
     except Exception:
         pass
+
     return "", "none"
 
 # Swap/Decode wie v3
@@ -69,7 +70,7 @@ class BleOutbackClient:
     BASE_MIN_INTERVAL = 1.8   # exakt wie v3
     BACKOFF_MAX       = 15.0  # v3-Backoff-Leiter
 
-    def __init__(self, mac: str = "B0:7E:11:F9:BC:F2", hci: str = "hci0",
+    def __init__(self, mac: str = "", hci: str = "hci0",
                  min_interval_s: float = BASE_MIN_INTERVAL, backoff_max_s: float = BACKOFF_MAX,
                  debug: bool = False):
         self.mac, self._mac_src = _resolve_mac(mac)
@@ -98,6 +99,9 @@ class BleOutbackClient:
             log_ble.debug("init: backend=%s mac=%s(src=%s) hci=%s addr=%s min=%.1fs backoff<=%.1fs",
                           self.backend, (self.mac or "<EMPTY>"), self._mac_src, self.hci, self.addr_type,
                           self.min_interval_s, self.backoff_max_s)
+
+        if not self.mac:
+            raise ValueError("Keine BLE-MAC gesetzt. Übergib --ble-mac oder setze OUTBACK_BLE_MAC.")
 
         # sofort erste Runde
         self._schedule_next(success=True)

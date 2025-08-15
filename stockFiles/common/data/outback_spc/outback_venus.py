@@ -205,6 +205,48 @@ def _bt_info(mac: str) -> Dict[str, str]:
     return info
 
 
+# Helper: Pairing mit PIN via bluetoothctl
+def _bt_pair_with_pin(mac: str, pin: str, log) -> bool:
+    """
+    Versucht, via bluetoothctl mit PIN zu pairen.
+    Ablauf:
+      1) agent KeyboardOnly
+      2) default-agent
+      3) pair <MAC>
+      4) PIN an stdin übergeben
+    Erfolgsprüfung über bluetoothctl-Ausgabe und anschließendes `info`.
+    """
+    try:
+        # Agent initialisieren
+        _btctl("agent KeyboardOnly", timeout=5)
+        _btctl("default-agent", timeout=5)
+
+        # Interaktiv pairen und PIN einspeisen
+        p = subprocess.Popen(["bluetoothctl"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            cmds = f"pair {mac}\n{pin}\n"
+            stdout, stderr = p.communicate(input=cmds, timeout=25)
+            log.debug(f"pair(pin): stdout={stdout.strip()} stderr={stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            p.kill()
+            log.warning(f"autodetect: Pairing Timeout für {mac}")
+        except Exception as e:
+            try: p.kill()
+            except Exception: pass
+            log.warning(f"autodetect: Pairing-Fehler für {mac}: {e}")
+
+        # Erfolg via info prüfen
+        info = _bt_info(mac)
+        paired = info.get("Paired", "no").lower() == "yes"
+        if paired:
+            log.info(f"autodetect: Pair mit PIN erfolgreich für {mac}")
+            return True
+        return False
+    except Exception as e:
+        log.warning(f"autodetect: Pairing-Exception für {mac}: {e}")
+        return False
+
+
 def autodetect_outback_mac(log, target_name: str = "ID55355535553555") -> Dict[str, str]:
     """Sucht Outback anhand des Anzeigenamens, führt trust/pair aus (idempotent),
     und liefert {mac, addrtype, paired, trusted, source}."""
@@ -238,12 +280,17 @@ def autodetect_outback_mac(log, target_name: str = "ID55355535553555") -> Dict[s
         trusted = info.get("Trusted", "no").lower() == "yes"
 
     if not paired:
-        log.info(f"autodetect: versuche pair mit {mac}")
-        _btctl(f"pair {mac}", timeout=12)
+        # PIN aus ENV oder Default 123456
+        pin = os.getenv("OUTBACK_BLE_PAIRPIN", "123456")
+        log.info(f"autodetect: versuche pair mit PIN für {mac} (PIN={'*'*len(pin)})")
+        ok = _bt_pair_with_pin(mac, pin, log)
+        if not ok:
+            log.warning("autodetect: Pairing mit PIN nicht bestätigt – versuche einmal ohne PIN")
+            _btctl(f"pair {mac}", timeout=12)
         info = _bt_info(mac)
         paired = info.get("Paired", "no").lower() == "yes"
         if not paired:
-            log.warning("autodetect: Pairing evtl. unvollständig (ggf. Bestätigung am Gerät nötig)")
+            log.warning("autodetect: Pairing nicht erfolgreich (ggf. Gerät/Display bestätigen)")
 
     log.info(f"autodetect: status paired={paired} trusted={trusted} addrType={addrtype}")
     return {"mac": mac, "addrtype": addrtype, "paired": paired, "trusted": trusted, "source": "scan"}
