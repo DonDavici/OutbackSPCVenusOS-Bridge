@@ -1,46 +1,39 @@
 # -*- coding: utf-8 -*-
 """
-Outback BLE Client (A03/A11 Round-Snapshot), Bleak-first mit bluepy-Fallback.
-- Bevorzugt Bleak (asyncio, BlueZ/DBus), harte Timeouts (Connect 3.0 s, Read 1.5 s)
-- Fällt automatisch auf bluepy mit Thread-Timeouts zurück, falls Bleak nicht verfügbar
-- Atomare Messung pro Runde (A03 + A11), Backoff/Throttle, Metriken
-Wichtig: PV (pv_w) nur diagnostisch; PV-AC wird projektseitig NICHT daraus abgeleitet.
+Outback BLE Client (A03/A11 Round-Snapshot) – bluepy-only, robust & getunt
+- Keine Bleak-Abhängigkeit (vereinfachte Installation auf Venus OS)
+- Harte Timeouts: Connect 3.0 s, Read 1.5 s (blockiert Mainloop nicht)
+- Exponential-Backoff mit Jitter
+- Auto-Tuning des addrType (public ↔ random) bei Fehlserien
+- Persistenz: merkt sich "last_good" addrType in /data/outback_spc/state.json
+- Detail-Logging im Debug-Modus
+Wichtig: PV (pv_w) diagnostisch; Projekt berechnet PV-AC separat (kein Doppelzählen).
 """
 
-import time, random, struct, os, re, logging, threading, asyncio
+from __future__ import annotations
+import time, random, struct, os, re, json, logging, threading
 from typing import Optional, Dict, Tuple
 
-# ── Versuche zuerst Bleak ─────────────────────────────────────
-try:
-    from bleak import BleakClient  # type: ignore
-    _HAVE_BLEAK = True
-except Exception:
-    _HAVE_BLEAK = False
-    BleakClient = None  # type: ignore
-
-# ── bluepy-Fallback ───────────────────────────────────────────
+# ───────── bluepy Import ─────────
 try:
     from bluepy.btle import Peripheral, BTLEException  # type: ignore
-    _HAVE_BLUEPY = True
 except Exception:
-    _HAVE_BLUEPY = False
-    Peripheral = None  # type: ignore
-    BTLEException = Exception  # type: ignore
+    Peripheral = None
+    BTLEException = Exception  # Fallback, damit Code nicht crasht
 
-# Outback Services/Chars (Platzhalter – wie bisher)
+# ───────── Outback Services/Chars (wie per Probe bestätigt) ─────────
 _SRV_1810 = '00001810-0000-1000-8000-00805f9b34fb'  # A03
 _SRV_1811 = '00001811-0000-1000-8000-00805f9b34fb'  # A11
 _A03      = '00002a03-0000-1000-8000-00805f9b34fb'
 _A11      = '00002a11-0000-1000-8000-00805f9b34fb'
 
-# Zustände laut Projektvorgabe (Heuristik)
+# ───────── Zustände (Heuristik) ─────────
 STATE_OFF = 0
 STATE_INVERT = 1
 STATE_CHARGE = 2
 STATE_PASSTHROUGH = 3
 
-# ── MAC-Utils ─────────────────────────────────────────────────
-import re
+# ───────── MAC-Utils ─────────
 _MAC_RE = re.compile(r"^[0-9A-F]{12}$")
 def _normalize_mac(s: str) -> str:
     if not s: return ""
@@ -54,33 +47,42 @@ def _resolve_mac(provided: str) -> Tuple[str, str]:
     env = _normalize_mac(os.getenv("OUTBACK_BLE_MAC", ""))
     if env: return env, "ENV"
     try:
-        import utils  # optional
+        import utils  # optionales Legacy-Config-Modul
         legacy = _normalize_mac(getattr(utils, "OUTBACK_ADDRESS", ""))
         if legacy: return legacy, "utils"
     except Exception:
         pass
-    return "B0:7E:11:F9:BC:F2", "default"
+    return "00:35:FF:02:95:99", "default"
 
-def _resolve_backend() -> str:
-    be = os.getenv("OUTBACK_BLE_BACKEND", "").lower()
-    if be in ("bleak", "bluepy"):
-        return be
-    return ""
+# ───────── State-Persistenz ─────────
+_STATE_PATH = "/data/outback_spc/state.json"
 
-def _resolve_addrtype() -> str:
-    at = os.getenv("OUTBACK_BLE_ADDRTYPE", "").lower()
-    if at in ("public", "random"):
-        return at
-    return "public"
+def _load_state() -> dict:
+    try:
+        with open(_STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_state(d: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(_STATE_PATH), exist_ok=True)
+        tmp = _STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2, sort_keys=True)
+        os.replace(tmp, _STATE_PATH)
+    except Exception:
+        pass
 
 def _swap_decode(buf: bytes) -> tuple:
     shorts = struct.unpack('>' + 'h' * (len(buf)//2), buf)
     return tuple(((v >> 8) & 255) | ((v & 255) << 8) for v in shorts)
 
-# ── bluepy: Thread-Timeout-Wrapper ───────────────────────────
+# ───────── Timeout-Wrapper (threaded) ─────────
 class _Box:
     __slots__ = ("val","err")
     def __init__(self): self.val=None; self.err=None
+
 def _call_with_timeout(fn, timeout_s: float):
     box = _Box()
     def run():
@@ -95,14 +97,15 @@ def _call_with_timeout(fn, timeout_s: float):
         raise box.err
     return box.val
 
+# ───────── Hauptklasse: bluepy-only Client ─────────
 class BleOutbackClient:
     """
-    Einheitliches Interface:
-      - snapshot() -> Dict oder None
-      - get_status() -> Dict für Logs
-    Intern: nutzt Bleak oder bluepy (Fallback), jeweils mit harten Timeouts.
+    Einheitliches Interface für den Daemon:
+      - snapshot() -> Dict oder None (atomare Runde A03+A11)
+      - get_status() -> Dict (für Logs/UI)
     """
 
+    # Debug-Helfer
     def _d(self, msg: str, *args):
         if not getattr(self, "debug", False): return
         try:
@@ -112,41 +115,77 @@ class BleOutbackClient:
             except Exception: print("[BLE DEBUG] " + msg)
 
     def __init__(self, mac: str = "", hci: str = "hci0",
-                 min_interval_s: float = 1.8, backoff_max_s: float = 15.0, debug: bool = False):
+                 min_interval_s: float = 1.8, backoff_max_s: float = 15.0,
+                 debug: bool = False):
         self.mac, self._mac_source = _resolve_mac(mac)
         self.hci = hci
         self.min_interval_s = float(min_interval_s or 1.8)
         self.backoff_max_s = float(backoff_max_s or 15.0)
         self.debug = bool(debug)
 
-        self._next_at = 0.0
+        # bluepy Backend-Felder
+        self._p = None; self._c03 = None; self._c11 = None
+
+        # Takt/Zustand
         self._busy = False
+        self._next_at = 0.0                      # sofort beim Start versuchen
         self._last_throttle_log = 0.0
         self._ok = 0; self._fail = 0
         self._acc_read_ms = 0.0; self._acc_skew_ms = 0.0
         self._last_metrics = 0.0
         self._consec_fails = 0
 
-        # Backend-spezifisch
-        wanted = _resolve_backend()
-        if wanted == "bleak":
-            self._backend = "bleak" if _HAVE_BLEAK else ("bluepy" if _HAVE_BLUEPY else "none")
-        elif wanted == "bluepy":
-            self._backend = "bluepy" if _HAVE_BLUEPY else ("bleak" if _HAVE_BLEAK else "none")
-        else:
-            self._backend = "bleak" if _HAVE_BLEAK else ("bluepy" if _HAVE_BLUEPY else "none")
-        self.addr_type = _resolve_addrtype()
+        # addrType Auto-Tuning & Persistenz
+        st = _load_state()
+        last_good = (st.get("ble") or {}).get("last_good_addr")
+        self.addr_type = last_good if last_good in ("public", "random") else "public"
+        self._tuned_once = False  # wurde in dieser Session bereits getoggelt?
 
-        self._client = None      # BleakClient oder bluepy.Peripheral
-        self._c03 = None; self._c11 = None
-
-        # Status
+        # Öffentlicher Status
         self.last_status = "init"
         self.last_error = ""
-        self._d("init: backend=%s addr_type=%s mac=%s (source=%s) hci=%s min=%.1fs backoff<=%.1fs",
-                self._backend, self.addr_type, self.mac, self._mac_source, self.hci, self.min_interval_s, self.backoff_max_s)
+        self.backend = "bluepy"
 
-    # ── Gemeinsame Planung/Stats ───────────────────────────────
+        self._d("init: backend=%s mac=%s (src=%s) hci=%s addr=%s min=%.1fs backoff<=%.1fs",
+                self.backend, self.mac, self._mac_source, self.hci, self.addr_type,
+                self.min_interval_s, self.backoff_max_s)
+
+    # ───────── interne Helfer ─────────
+    def _iface_index(self) -> int:
+        try:
+            return int(self.hci[3:]) if self.hci.startswith("hci") else 0
+        except Exception:
+            return 0
+
+    def _connect(self):
+        if Peripheral is None or not self.mac:
+            raise RuntimeError("bluepy nicht verfügbar oder MAC leer (setze --ble-mac / OUTBACK_BLE_MAC / utils.OUTBACK_ADDRESS)")
+        self._d("connect: trying mac=%s on %s (%s)", self.mac, self.hci, self.addr_type)
+
+        def _do_connect():
+            p = Peripheral(self.mac, iface=self._iface_index(), addrType=self.addr_type)
+            s10 = p.getServiceByUUID(_SRV_1810)
+            s11 = p.getServiceByUUID(_SRV_1811)
+            c03 = s10.getCharacteristics(_A03)[0]
+            c11 = s11.getCharacteristics(_A11)[0]
+            return p, c03, c11
+
+        p, c03, c11 = _call_with_timeout(_do_connect, 3.0)
+        self._p, self._c03, self._c11 = p, c03, c11
+        self._consec_fails = 0
+        self.last_status = "connected"
+        self._d("connect: OK (services ready)")
+
+    def _disconnect(self):
+        self._d("disconnect: requested")
+        try:
+            if self._p: self._p.disconnect()
+        except Exception:
+            pass
+        self._p = self._c03 = self._c11 = None
+        self.last_status = "disconnected"
+        self._d("disconnect: done")
+
     def _schedule_next(self, success: bool):
         now = time.monotonic()
         if success:
@@ -157,7 +196,7 @@ class BleOutbackClient:
             delay = min(ladder[idx], self.backoff_max_s)
         delay += random.uniform(0.0, 0.2)
         self._next_at = now + delay
-        self._d("schedule: next in %.1fs (success=%s, consec_fails=%d)", delay, success, self._consec_fails)
+        self._d("schedule: next in %.1fs (success=%s, consec=%d)", delay, success, self._consec_fails)
 
     def _metrics(self):
         now = time.monotonic()
@@ -168,103 +207,42 @@ class BleOutbackClient:
         self._d("stats: ok=%d fail=%d avg_read=%.1fms avg_skew=%.1fms next=%.2fs",
                 self._ok, self._fail, avg_read, avg_skew, max(0.0, self._next_at - now))
 
-    # ── Bleak Backend ─────────────────────────────────────────
-    async def _bleak_connect(self):
-        self._d("bleak connect: trying %s", self.mac)
-        cli = BleakClient(self.mac, timeout=3.0)
-        await cli.connect()  # wirft bei Fehler
-        # Char-Handles via UUIDs (Bleak nutzt UUID → direkte Reads ok)
-        self._client = cli
-        self._d("bleak connect: OK")
+    def _persist_last_good(self):
+        st = _load_state()
+        st.setdefault("ble", {})["last_good_addr"] = self.addr_type
+        _save_state(st)
+        self._d("persist: last_good_addr=%s saved", self.addr_type)
 
-    async def _bleak_read_pair(self) -> Tuple[bytes, bytes]:
-        assert self._client is not None
-        cli: BleakClient = self._client  # type: ignore
-        # liest beide Characteristics mit eigenem Timeout
-        async def read_uuid(u: str, to: float) -> bytes:
-            return await asyncio.wait_for(cli.read_gatt_char(u), timeout=to)
-        raw_a03 = await read_uuid(_A03, 1.5)
-        raw_a11 = await read_uuid(_A11, 1.5)
-        return raw_a03, raw_a11
-
-    async def _bleak_disconnect(self):
-        try:
-            if self._client:
-                await asyncio.wait_for(self._client.disconnect(), timeout=1.0)
-        except Exception:
-            pass
-        self._client = None
-        self._d("bleak disconnect: done")
-
-    # ── bluepy Backend ────────────────────────────────────────
-    def _bluepy_connect(self):
-        if not _HAVE_BLUEPY:
-            raise RuntimeError("bluepy nicht verfügbar")
-        self._d("bluepy connect: trying %s on %s", self.mac, self.hci)
-        def _do_connect():
-            iface = int(self.hci[3:]) if self.hci.startswith("hci") else 0
-            p = Peripheral(self.mac, iface=iface, addrType=self.addr_type)
-            s10 = p.getServiceByUUID(_SRV_1810)
-            s11 = p.getServiceByUUID(_SRV_1811)
-            c03 = s10.getCharacteristics(_A03)[0]
-            c11 = s11.getCharacteristics(_A11)[0]
-            return p, c03, c11
-        p, c03, c11 = _call_with_timeout(_do_connect, 3.0)
-        self._client, self._c03, self._c11 = p, c03, c11
-        self._d("bluepy connect: OK")
-
-    def _bluepy_read_pair(self) -> Tuple[bytes, bytes]:
-        raw_a03 = _call_with_timeout(lambda: self._c03.read(), 1.5)
-        raw_a11 = _call_with_timeout(lambda: self._c11.read(), 1.5)
-        return raw_a03, raw_a11
-
-    def _bluepy_disconnect(self):
-        try:
-            if self._client: self._client.disconnect()
-        except Exception:
-            pass
-        self._client = self._c03 = self._c11 = None
-        self._d("bluepy disconnect: done")
-
-    # ── Öffentliche API ───────────────────────────────────────
+    # ───────── öffentliche API ─────────
     def snapshot(self) -> Optional[Dict]:
+        """Atomarer Snapshot (A03 + A11) oder None bei (temporärem) Fehler/Throttle."""
         now = time.monotonic()
         if now < self._next_at:
             self.last_status = "throttle"
-            self._d("throttle: until %.3f (in %.1fs)", self._next_at, self._next_at - now)
             if self.debug and (now - self._last_throttle_log > 5.0):
                 self._last_throttle_log = now
+                self._d("throttle: until %.3f (in %.1fs)", self._next_at, self._next_at - now)
             self._metrics()
             return None
 
         if self._busy:
-            self.last_status = "busy"
-            self._d("snapshot: busy, skipping")
-            return None
+            self.last_status = "busy"; self._d("snapshot: busy, skip"); return None
         self._busy = True
 
-        t0 = time.monotonic()
         try:
-            # Verbindungsaufbau bei Bedarf
-            if self._client is None:
-                if self._backend == "bleak":
-                    if not _HAVE_BLEAK:
-                        self._backend = "bluepy"
-                    else:
-                        asyncio.run(asyncio.wait_for(self._bleak_connect(), timeout=3.5))
-                if self._client is None and self._backend == "bluepy":
-                    self._bluepy_connect()
+            if not self._p:
+                self._connect()
 
-            # Lesen (Paar)
-            if self._backend == "bleak":
-                raw_a03, raw_a11 = asyncio.run(asyncio.wait_for(self._bleak_read_pair(), timeout=3.2))
-            else:
-                raw_a03, raw_a11 = self._bluepy_read_pair()
+            t0 = time.monotonic()
+            raw_a03 = _call_with_timeout(lambda: self._c03.read(), 1.5)
+            t_mid = time.monotonic()
+            raw_a11 = _call_with_timeout(lambda: self._c11.read(), 1.5)
             t1 = time.monotonic()
 
             a03 = _swap_decode(raw_a03)
             a11 = _swap_decode(raw_a11)
             read_ms = (t1 - t0) * 1000.0
+            skew_ms = (t1 - t_mid) * 1000.0
 
             acV = a03[2] * 0.1
             acF = a03[3] * 0.1
@@ -275,22 +253,24 @@ class BleOutbackClient:
             pvV = a11[6] * 0.1
             pvP = float(a11[7])
 
-            # RSSI (nur bluepy sicher verfügbar; bei Bleak lassen wir 0)
-            rssi = 0
             try:
-                if _HAVE_BLUEPY and self._backend == "bluepy" and hasattr(self._client, "getRSSI"):
-                    rssi = int(self._client.getRSSI())
+                rssi = int(self._p.getRSSI()) if hasattr(self._p, "getRSSI") else 0
             except Exception:
-                pass
+                rssi = 0
 
             self._ok += 1
             self._acc_read_ms += read_ms
+            self._acc_skew_ms += skew_ms
             self._schedule_next(success=True)
             self._metrics()
 
+            # Erfolg → addrType merken
+            self._persist_last_good()
+            self._tuned_once = False
+
             self.last_status = "ok"; self.last_error = ""
-            self._d("%s round OK: acV=%.1fV L1=%0.0fW pv=%0.0fW dc=%.2fV %+0.2fA rssi=%d read=%.1fms",
-                    self._backend, acV, l1_power, pvP, dcV, dcI, rssi, read_ms)
+            self._d("round OK: acV=%.1fV L1=%0.0fW pv=%0.0fW dc=%.2fV %+0.2fA rssi=%d read=%.1fms skew=%.1fms",
+                    acV, l1_power, pvP, dcV, dcI, rssi, read_ms, skew_ms)
 
             return {
                 "power_w": max(0.0, l1_power),
@@ -303,26 +283,32 @@ class BleOutbackClient:
                 "ts": int(time.time())
             }
 
-        except (asyncio.TimeoutError, TimeoutError) as e:
+        except (TimeoutError, BTLEException) as e:
             self._fail += 1; self._consec_fails += 1
-            self.last_status = "timeout"; self.last_error = str(e)
-            self._d("%s TIMEOUT: %s | consec=%d", self._backend, str(e), self._consec_fails)
-            try:
-                if self._backend == "bleak": asyncio.run(self._bleak_disconnect())
-                else: self._bluepy_disconnect()
+            self.last_status = "timeout" if isinstance(e, TimeoutError) else "btle_error"
+            self.last_error = str(e)
+            self._d("round FAIL(%s): %s | consec=%d", self.last_status, str(e), self._consec_fails)
+
+            # Auto-Tuning: bei erster Fehlserie >3 Versuchen addrType toggeln (einmal pro Serie)
+            if self._consec_fails >= 3 and not self._tuned_once:
+                self._tuned_once = True
+                self.addr_type = "random" if self.addr_type == "public" else "public"
+                self._d("auto-tune: toggled addr_type -> %s", self.addr_type)
+
+            try: self._disconnect()
             except Exception: pass
             self._schedule_next(success=False)
             return None
+
         except Exception as e:
             self._fail += 1; self._consec_fails += 1
             self.last_status = "error"; self.last_error = str(e)
-            self._d("%s FAIL: %s | consec=%d", self._backend, str(e), self._consec_fails)
-            try:
-                if self._backend == "bleak": asyncio.run(self._bleak_disconnect())
-                else: self._bluepy_disconnect()
+            self._d("round FAIL: %s | consec=%d", str(e), self._consec_fails)
+            try: self._disconnect()
             except Exception: pass
             self._schedule_next(success=False)
             return None
+
         finally:
             self._busy = False
 
@@ -338,6 +324,6 @@ class BleOutbackClient:
             "next_in_s": round(next_in, 2),
             "mac": self.mac,
             "hci": self.hci,
-            "backend": self._backend,
-            "addr_type": getattr(self, "addr_type", "?"),
+            "backend": self.backend,
+            "addr_type": self.addr_type,
         }
