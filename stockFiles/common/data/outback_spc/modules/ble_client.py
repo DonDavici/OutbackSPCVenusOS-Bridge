@@ -52,7 +52,7 @@ def _resolve_mac(provided: str) -> Tuple[str, str]:
         if legacy: return legacy, "utils"
     except Exception:
         pass
-    return "00:35:FF:02:95:99", "default"
+    return "B0:7E:11:F9:BC:F2", "default"
 
 # ───────── State-Persistenz ─────────
 _STATE_PATH = "/data/outback_spc/state.json"
