@@ -363,15 +363,16 @@ def main():
     log_et  = make_logger("ET112", settings.get("/Settings/Log/ET112", "INFO"), args.log_format, rl_ms)
     log_tst = make_logger("TEST", settings.get("/Settings/Log/TestMode", "INFO"), args.log_format, rl_ms)
 
-    # Dienste
-    dry = args.dry_run or (not is_real_dbus())
+    # Dienste – Standard NICHT-DRY; nur wenn --dry-run gesetzt wurde
+    dry = bool(args.dry_run)
+    log_core.debug(f"dbus: is_real_dbus={is_real_dbus()}")
     if dry:
         log_core.warning("dbus: running in DRY mode (no system bus registration)")
     inverter, pvinv, grid, l2, l3 = init_services(args, settings, dry)
     log_core.info(
-        "dbus: services registered (dry=%s) di_inv=%d di_pv=%d di_grid=%d di_l2=%d di_l3=%d limits[L1=%d L2=%d L3=%d]",
-        str(bool(dry)).lower(), args.di_inverter, args.di_pvinverter, args.di_grid, args.di_l2, args.di_l3,
-        args.l1_limit, args.l2_limit, args.l3_limit,
+        f"dbus: services registered (dry={str(dry).lower()}) "
+        f"di_inv={args.di_inverter} di_pv={args.di_pvinverter} di_grid={args.di_grid} di_l2={args.di_l2} di_l3={args.di_l3} "
+        f"limits[L1={args.l1_limit} L2={args.l2_limit} L3={args.l3_limit}]"
     )
     _dbus_presence_log(log_core)
 
