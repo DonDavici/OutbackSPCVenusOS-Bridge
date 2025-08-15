@@ -154,6 +154,24 @@ def init_services(args, settings: SettingsStore, dry: bool):
     return inverter, pvinv, grid, l2, l3
 
 
+# Helper: Prüft, ob Services wirklich auf dem System-Bus sichtbar sind, inkl. Logging
+def _dbus_presence_log(log_core):
+    try:
+        import dbus  # nur wenn verfügbar
+        names = set(dbus.SystemBus().list_names())
+        targets = [
+            "com.victronenergy.inverter.outback_l1",
+            "com.victronenergy.pvinverter.outback_l1",
+            "com.victronenergy.grid.generator_tuya",
+            "com.victronenergy.acmeter.et112_l2",
+            "com.victronenergy.acmeter.et112_l3",
+        ]
+        for n in targets:
+            log_core.info(f"dbus: present[{n}]={n in names}")
+    except Exception as e:
+        log_core.warning(f"dbus: presence‑check skipped ({e})")
+
+
 def midnight_changed(last_ymd: str) -> (bool, str):
     now_ymd = date.today().isoformat()
     return (last_ymd != now_ymd), now_ymd
@@ -347,7 +365,15 @@ def main():
 
     # Dienste
     dry = args.dry_run or (not is_real_dbus())
+    if dry:
+        log_core.warning("dbus: running in DRY mode (no system bus registration)")
     inverter, pvinv, grid, l2, l3 = init_services(args, settings, dry)
+    log_core.info(
+        "dbus: services registered (dry=%s) di_inv=%d di_pv=%d di_grid=%d di_l2=%d di_l3=%d limits[L1=%d L2=%d L3=%d]",
+        str(bool(dry)).lower(), args.di_inverter, args.di_pvinverter, args.di_grid, args.di_l2, args.di_l3,
+        args.l1_limit, args.l2_limit, args.l3_limit,
+    )
+    _dbus_presence_log(log_core)
 
     # Quellen
     testmode = TestMode(settings=settings, seed=args.seed, scenario=args.testmode)
@@ -588,6 +614,22 @@ def main():
         l3.update(power=l3_power_s, voltage=230.0 if l3_power_s > 0 else 0.0,
                   current=(l3_power_s / 230.0) if l3_power_s > 0 else 0.0,
                   forward_kwh=l3_forward_kwh)
+
+        try:
+            # kurze Bestätigung der letzten Publikationen
+            log_core.debug(
+                "dbus pub: PV.L1=%dW fwd=%.3fkWh | INV.L1=%dW V=%.1fA=%.2f state=%d",
+                int(round(pv_ac_s)), pv_forward_kwh, int(round(l1_power_s)), 230.0, (l1_power_s/230.0 if 230.0 else 0.0), int(outback_state)
+            )
+            # UpdateIndex anzeigen (falls verfügbar)
+            try:
+                ui_pv  = pvinv.svc.get("/UpdateIndex", None)
+                ui_inv = inverter.svc.get("/UpdateIndex", None)
+                log_core.debug(f"dbus idx: pv={ui_pv} inv={ui_inv}")
+            except Exception:
+                pass
+        except Exception:
+            pass
 
         # === Logging (kurz & knapp) ===
         log_pv.info(f"l1_pv={int(round(pv_ac_s))}W → pvinverter:/Ac/L1/Power")
