@@ -8,7 +8,7 @@ Outback BLE Client (A03/A11 Round-Snapshot) – robuste Implementierung:
 Wichtig: PV-Wert (pv_w) dient nur zur Diagnose; PV-AC im Projekt wird NICHT daraus abgeleitet.
 """
 
-import time, random, struct, os, re
+import time, random, struct, os, re, logging
 from typing import Optional, Dict
 
 try:
@@ -71,6 +71,18 @@ class BleOutbackClient:
     snapshot() liefert bei Erfolg ein Dict, sonst None.
     """
 
+    def _d(self, msg: str, *args):
+        """Debug-Ausgaben: bevorzugt Python-Logging, fällt auf print zurück."""
+        if not getattr(self, "debug", False):
+            return
+        try:
+            logging.getLogger("BLE").debug(msg, *args)
+        except Exception:
+            try:
+                print("[BLE DEBUG] " + (msg % args if args else msg))
+            except Exception:
+                print("[BLE DEBUG] " + msg)
+
     def __init__(self, mac: str = "", hci: str = "hci0",
                  min_interval_s: float = 1.8, backoff_max_s: float = 15.0, debug: bool = False):
         self.mac = _pick_mac(mac)
@@ -92,10 +104,16 @@ class BleOutbackClient:
         self._last_metrics = 0.0
         self._consec_fails = 0
 
+        # Öffentliche Statusfelder für externe Logs
+        self.last_status = "init"
+        self.last_error = ""
+        self._d("init: mac=%s (source=%s) hci=%s min=%.1fs backoff<=%.1fs", self.mac, getattr(self, "_mac_source", "?"), self.hci, self.min_interval_s, self.backoff_max_s)
+
     # ——— intern ———
     def _connect(self):
         if Peripheral is None or not self.mac:
             raise RuntimeError("BLE nicht verfügbar oder MAC leer (setze --ble-mac oder ENV OUTBACK_BLE_MAC oder utils.OUTBACK_ADDRESS)")
+        self._d("connect: trying mac=%s on %s", self.mac, self.hci)
         iface = int(self.hci[3:]) if self.hci.startswith("hci") else 0
         self._p = Peripheral(self.mac, iface=iface)
         s10 = self._p.getServiceByUUID(_SRV_1810)
@@ -103,14 +121,19 @@ class BleOutbackClient:
         self._c03 = s10.getCharacteristics(_A03)[0]
         self._c11 = s11.getCharacteristics(_A11)[0]
         self._consec_fails = 0
+        self._d("connect: OK (services ready), consec_fails reset")
+        self.last_status = "connected"
 
     def _disconnect(self):
+        self._d("disconnect: requested")
         try:
             if self._p:
                 self._p.disconnect()
         except Exception:
             pass
         self._p = self._c03 = self._c11 = None
+        self._d("disconnect: done")
+        self.last_status = "disconnected"
 
     def _schedule_next(self, success: bool):
         now = time.monotonic()
@@ -123,6 +146,7 @@ class BleOutbackClient:
             delay = min(ladder[idx], self.backoff_max_s)
         delay += random.uniform(0.0, 0.2)
         self._next_at = now + delay
+        self._d("schedule: next in %.1fs (success=%s, consec_fails=%d)", delay, success, self._consec_fails)
 
     def _metrics(self):
         now = time.monotonic()
@@ -142,12 +166,16 @@ class BleOutbackClient:
         now = time.monotonic()
         # Throttle
         if now < self._next_at:
+            self.last_status = "throttle"
+            self._d("throttle: until %.3f (in %.1fs)", self._next_at, self._next_at - now)
             if self.debug and (now - self._last_throttle_log > 5.0):
                 self._last_throttle_log = now
             self._metrics()
             return None
 
         if self._busy:
+            self.last_status = "busy"
+            self._d("snapshot: busy, skipping")
             return None
         self._busy = True
 
@@ -163,6 +191,9 @@ class BleOutbackClient:
 
             a03 = _swap_decode(raw_a03)
             a11 = _swap_decode(raw_a11)
+
+            read_ms = (t1 - t0) * 1000.0
+            skew_ms = (t1 - t_mid) * 1000.0
 
             # A03 typische Indizes (aus v3.0 abgeleitet)
             acV = a03[2] * 0.1
@@ -182,10 +213,14 @@ class BleOutbackClient:
                 rssi = 0
 
             self._ok += 1
-            self._acc_read_ms += (t1 - t0) * 1000.0
-            self._acc_skew_ms += (t1 - t_mid) * 1000.0
+            self._acc_read_ms += read_ms
+            self._acc_skew_ms += skew_ms
             self._schedule_next(success=True)
             self._metrics()
+
+            self.last_status = "ok"
+            self.last_error = ""
+            self._d("round OK: acV=%.1fV L1=%0.0fW pv=%0.0fW dc=%.2fV %+0.2fA rssi=%d read=%.1fms skew=%.1fms", acV, l1_power, pvP, dcV, dcI, rssi, read_ms, skew_ms)
 
             # Hinweis: /State kann über BLE nicht sauber gelesen werden → Heuristik „Invert“
             return {
@@ -199,17 +234,40 @@ class BleOutbackClient:
                 "ts": int(time.time())
             }
 
-        except BTLEException:
+        except BTLEException as e:
             self._fail += 1
             self._consec_fails += 1
+            self.last_status = "btle_error"
+            self.last_error = str(e)
+            self._d("round FAIL(BTLE): %s | consec=%d", str(e), self._consec_fails)
             # harte Fehler: Disconnect & kurz warten
             self._disconnect()
             self._schedule_next(success=False)
             return None
-        except Exception:
+        except Exception as e:
             self._fail += 1
             self._consec_fails += 1
+            self.last_status = "error"
+            self.last_error = str(e)
+            self._d("round FAIL: %s | consec=%d", str(e), self._consec_fails)
             self._schedule_next(success=False)
             return None
         finally:
             self._busy = False
+            # no-op, status bereits gesetzt
+            pass
+
+    def get_status(self) -> dict:
+        """Kompakter Status für externe Logs/UI."""
+        now = time.monotonic()
+        next_in = max(0.0, self._next_at - now)
+        return {
+            "status": self.last_status,
+            "error": self.last_error,
+            "ok": self._ok,
+            "fail": self._fail,
+            "consec_fails": self._consec_fails,
+            "next_in_s": round(next_in, 2),
+            "mac": self.mac,
+            "hci": self.hci,
+        }

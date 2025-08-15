@@ -247,6 +247,9 @@ def main():
 
     # Summenlogger
     summary = Summary(period_s=int(settings.get("/Settings/Log/SummaryPeriodSec", 5)))
+    # BLE-Status CORE-DEBUG Ticker (~5s)
+    ble_dbg_last = 0.0
+    ble_dbg_period = 5.0
 
     # Einmal Dump?
     if args.dump_now:
@@ -310,6 +313,23 @@ def main():
             gen_power = tuya.read_power()
             pv_ac = compute_pv_ac(l1_power, batt_p)
             pv_dc = 0.0  # DC-PV ausschließlich externer Victron-MPPT, hier NICHT ableiten!
+
+        # === BLE-Status (CORE DEBUG, alle ~5s) ===
+        now_mono = time.monotonic()
+        if (now_mono - ble_dbg_last) >= ble_dbg_period:
+            try:
+                s = ble.get_status() if hasattr(ble, "get_status") else {}
+            except Exception:
+                s = {}
+            stat = s.get("status", "n/a")
+            nxt = s.get("next_in_s", 0.0)
+            okc = s.get("ok", 0)
+            flc = s.get("fail", 0)
+            cfc = s.get("consec_fails", 0)
+            mac = s.get("mac", "?")
+            hci = s.get("hci", "?")
+            log_core.debug(f"BLE[{stat}] mac={mac} hci={hci} next={nxt:.1f}s ok={okc} fail={flc} consec={cfc} rssi={rssi}")
+            ble_dbg_last = now_mono
 
         # === EMA-Glättung ===
         l1_power_s = ema_p_l1.update(l1_power)
