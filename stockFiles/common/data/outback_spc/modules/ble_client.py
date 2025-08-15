@@ -4,7 +4,7 @@ Outback BLE Client (A03/A11 Round-Snapshot) – bluepy-only, robust & getunt
 - Keine Bleak-Abhängigkeit (vereinfachte Installation auf Venus OS)
 - Harte Timeouts: Connect 3.0 s, Read 1.5 s (blockiert Mainloop nicht)
 - Exponential-Backoff mit Jitter
-- Auto-Tuning des addrType (public ↔ random) bei Fehlserien
+- AddrType per ENV oder Persistenz; kein Auto-Tuning
 - Persistenz: merkt sich "last_good" addrType in /data/outback_spc/state.json
 - Detail-Logging im Debug-Modus
 Wichtig: PV (pv_w) diagnostisch; Projekt berechnet PV-AC separat (kein Doppelzählen).
@@ -53,6 +53,13 @@ def _resolve_mac(provided: str) -> Tuple[str, str]:
     except Exception:
         pass
     return "B0:7E:11:F9:BC:F2", "default"
+
+# ───────── AddrType aus ENV lesen (optional Override) ─────────
+_DEF_ADDR_TYPES = ("public", "random")
+
+def _resolve_addrtype_env() -> Optional[str]:
+    val = (os.getenv("OUTBACK_BLE_ADDRTYPE", "") or "").strip().lower()
+    return val if val in _DEF_ADDR_TYPES else None
 
 # ───────── State-Persistenz ─────────
 _STATE_PATH = "/data/outback_spc/state.json"
@@ -137,9 +144,12 @@ class BleOutbackClient:
 
         # addrType Auto-Tuning & Persistenz
         st = _load_state()
-        last_good = (st.get("ble") or {}).get("last_good_addr")
-        self.addr_type = last_good if last_good in ("public", "random") else "public"
-        self._tuned_once = False  # wurde in dieser Session bereits getoggelt?
+        env_addr = _resolve_addrtype_env()
+        if env_addr is not None:
+            self.addr_type = env_addr
+        else:
+            last_good = (st.get("ble") or {}).get("last_good_addr")
+            self.addr_type = last_good if last_good in ("public", "random") else "public"
 
         # Öffentlicher Status
         self.last_status = "init"
@@ -266,7 +276,6 @@ class BleOutbackClient:
 
             # Erfolg → addrType merken
             self._persist_last_good()
-            self._tuned_once = False
 
             self.last_status = "ok"; self.last_error = ""
             self._d("round OK: acV=%.1fV L1=%0.0fW pv=%0.0fW dc=%.2fV %+0.2fA rssi=%d read=%.1fms skew=%.1fms",
@@ -288,12 +297,6 @@ class BleOutbackClient:
             self.last_status = "timeout" if isinstance(e, TimeoutError) else "btle_error"
             self.last_error = str(e)
             self._d("round FAIL(%s): %s | consec=%d", self.last_status, str(e), self._consec_fails)
-
-            # Auto-Tuning: bei erster Fehlserie >3 Versuchen addrType toggeln (einmal pro Serie)
-            if self._consec_fails >= 3 and not self._tuned_once:
-                self._tuned_once = True
-                self.addr_type = "random" if self.addr_type == "public" else "public"
-                self._d("auto-tune: toggled addr_type -> %s", self.addr_type)
 
             try: self._disconnect()
             except Exception: pass
