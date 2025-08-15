@@ -220,7 +220,7 @@ def main():
         s0 = ble.get_status() if hasattr(ble, "get_status") else {}
     except Exception:
         s0 = {}
-    log_core.info("startup: BLE mac=%s (hci=%s) debug=%s", s0.get("mac", args.ble_mac or "?"), s0.get("hci", args.hci), str(bool(args.debug)).lower())
+    log_core.info(f"startup: BLE mac={s0.get('mac', args.ble_mac or '?')} "f"(hci={s0.get('hci', args.hci)}) "f"debug={str(bool(args.debug)).lower()}")
     batt_reader = BatteryDbusReader()
     tuya = TuyaClient(dev_id=args.tuya_id, local_key=args.tuya_key)
     et_l2 = Et112Reader(source_hint=args.et112_l2)
