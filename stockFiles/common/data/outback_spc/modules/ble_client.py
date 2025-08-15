@@ -69,7 +69,7 @@ class BleOutbackClient:
     BASE_MIN_INTERVAL = 1.8   # exakt wie v3
     BACKOFF_MAX       = 15.0  # v3-Backoff-Leiter
 
-    def __init__(self, mac: str = "", hci: str = "hci0",
+    def __init__(self, mac: str = "B0:7E:11:F9:BC:F2", hci: str = "hci0",
                  min_interval_s: float = BASE_MIN_INTERVAL, backoff_max_s: float = BACKOFF_MAX,
                  debug: bool = False):
         self.mac, self._mac_src = _resolve_mac(mac)
