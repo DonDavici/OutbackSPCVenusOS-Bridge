@@ -1,0 +1,13 @@
+[Unit]
+Description=Outback SPC → Venus OS Bridge
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /data/outback_spc/outback_venus.py --l1-limit 3000 --l2-limit 3000 --l3-limit 1500
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

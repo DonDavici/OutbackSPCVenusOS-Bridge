@@ -1,0 +1,6 @@
+# Optionale Metadaten für SetupHelper
+[Package]
+Name=Outback SPC Venus
+Version=1.0.0
+Description=Outback SPC → Venus OS D-Bus Bridge (AC-PV ohne Doppelzählung)
+Author=You

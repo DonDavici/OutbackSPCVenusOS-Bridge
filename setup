@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Einfaches SetupHelper-kompatibles Install/Uninstall-Skript für Venus OS.
+# Kopiert Dateien nach /data, richtet systemd-Service ein.
+# Nutzung:
+#   ./setup install
+#   ./setup uninstall
+#   ./setup reinstall
+
+set -euo pipefail
+
+PKG_NAME="outback-spc-venus"
+SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
+STOCK="${SRC_DIR}/stockFiles/common"
+TARGET_DATA="/data"
+TARGET_APP_DIR="${TARGET_DATA}/outback_spc"
+TARGET_SYSTEMD_DIR="${TARGET_DATA}/systemd"
+SERVICE_NAME="outback-venus.service"
+
+include_helpers() {
+  # SetupHelper Include: falls vorhanden, laden (optional)
+  if [ -f "/opt/victronenergy/SetupHelper/scripts/IncludeHelpers" ]; then
+    # shellcheck disable=SC1091
+    . "/opt/victronenergy/SetupHelper/scripts/IncludeHelpers"
+  fi
+}
+
+install_files() {
+  echo "[*] Installiere Dateien nach ${TARGET_DATA} …"
+  mkdir -p "${TARGET_APP_DIR}" "${TARGET_SYSTEMD_DIR}"
+  rsync -a "${STOCK}/data/outback_spc/" "${TARGET_APP_DIR}/"
+  rsync -a "${STOCK}/data/systemd/${SERVICE_NAME}" "${TARGET_SYSTEMD_DIR}/${SERVICE_NAME}"
+
+  # Rechte
+  chmod 755 "${TARGET_APP_DIR}/outback_venus.py"
+  chmod 644 "${TARGET_SYSTEMD_DIR}/${SERVICE_NAME}"
+  find "${TARGET_APP_DIR}" -type f -name "*.py" -exec chmod 644 {} \;
+
+  # Initiale Persistenzdatei anlegen, falls nicht vorhanden
+  if [ ! -f "${TARGET_APP_DIR}/state.json" ]; then
+    cat > "${TARGET_APP_DIR}/state.json" <<'JSON'
+{"pv_forward_kwh":0.0,"last_reset_ymd":"","l2_forward_kwh":0.0,"l3_forward_kwh":0.0,"settings":{}}
+JSON
+    chmod 644 "${TARGET_APP_DIR}/state.json"
+  fi
+
+  # Systemd verlinken/aktivieren (Venus OS lädt /data/systemd automatisch)
+  echo "[*] systemd neu laden & Service aktivieren …"
+  systemctl daemon-reload || true
+  systemctl enable "${TARGET_SYSTEMD_DIR}/${SERVICE_NAME}" || true
+}
+
+start_service() {
+  systemctl restart "${SERVICE_NAME}" || systemctl start "${SERVICE_NAME}" || true
+}
+
+stop_service() {
+  systemctl stop "${SERVICE_NAME}" || true
+}
+
+uninstall_files() {
+  echo "[*] Entferne Service & Dateien …"
+  stop_service
+  systemctl disable "${SERVICE_NAME}" || true
+  rm -f "${TARGET_SYSTEMD_DIR}/${SERVICE_NAME}"
+  rm -rf "${TARGET_APP_DIR}"
+  systemctl daemon-reload || true
+}
+
+cmd="${1:-}"
+include_helpers
+case "${cmd}" in
+  install)
+    install_files
+    start_service
+    echo "[OK] Installation abgeschlossen."
+    ;;
+  uninstall)
+    uninstall_files
+    echo "[OK] Deinstallation abgeschlossen."
+    ;;
+  reinstall|"")
+    uninstall_files || true
+    install_files
+    start_service
+    echo "[OK] Re-Installation abgeschlossen."
+    ;;
+esac
